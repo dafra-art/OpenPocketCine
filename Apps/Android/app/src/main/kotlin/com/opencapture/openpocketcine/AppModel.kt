@@ -14,6 +14,11 @@ import com.opencapture.opencine.cameracontrols.OperatorSetupModel
 import com.opencapture.opencine.cameracontrols.GimbalChromeHost
 import com.opencapture.opencine.cameracontrols.GimbalGamepadDriver
 import com.opencapture.opencine.cameracontrols.LiveGimbalPanel
+import com.opencapture.opencine.cameracontrols.GimbalShotPreset
+import com.opencapture.opencine.cameracontrols.GimbalShotPresets
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import com.opencapture.opencine.cameracontrols.LiveSheet
 import com.opencapture.opencine.dji.GimbalMoveEngine
 import com.opencapture.opencine.motion.GimbalWaypointSlot
@@ -585,6 +590,85 @@ class AppModel(
     override fun resumeProgrammedMove() = session.resumeProgrammedMove()
     override fun cancelProgrammedMove() = session.cancelProgrammedMove()
 
+    // Shot presets: saved framings per camera, kept across sessions in private prefs.
+    private val shotPrefs by lazy { appContext.getSharedPreferences(SHOT_PRESETS, Context.MODE_PRIVATE) }
+    private val _shotPresets = MutableStateFlow<List<GimbalShotPreset>>(emptyList())
+    private var shotPresetsCamera: String? = null
+    private val _shotTravel by lazy {
+        MutableStateFlow(shotPrefs.getFloat(SHOT_TRAVEL_KEY, GimbalShotPresets.DEFAULT_TRAVEL_SECONDS.toFloat()).toDouble())
+    }
+    override val supportsShotPresets: Boolean get() = session.hasGimbal
+    override val gimbalShotPresets: StateFlow<List<GimbalShotPreset>>
+        get() { syncShotPresets(); return _shotPresets.asStateFlow() }
+    override val shotTravelSeconds: StateFlow<Double> get() = _shotTravel.asStateFlow()
+
+    private fun syncShotPresets(): String? {
+        val camera = session.connectedCamera?.id
+        if (camera != shotPresetsCamera) {
+            shotPresetsCamera = camera
+            _shotPresets.value = camera?.let { GimbalShotPresets.decode(shotPrefs.getString("$SHOT_LIST_KEY.$it", null)) }
+                ?: emptyList()
+        }
+        return camera
+    }
+
+    private fun storeShotPresets(next: List<GimbalShotPreset>) {
+        val camera = syncShotPresets() ?: return
+        _shotPresets.value = next
+        shotPrefs.edit().putString("$SHOT_LIST_KEY.$camera", GimbalShotPresets.encode(next)).apply()
+    }
+
+    override fun saveGimbalShotPreset() {
+        if (syncShotPresets() == null) return
+        val pose = session.captureSteadyGimbalPose() ?: return
+        val current = _shotPresets.value
+        val name = GimbalShotPresets.nextDefaultName(current)
+        val next = GimbalShotPresets.add(current, GimbalShotPreset(java.util.UUID.randomUUID().toString(), name, pose))
+        if (next == null) {
+            session.presentControlNote("Up to ${GimbalShotPresets.MAX_PRESETS} shots per camera")
+            return
+        }
+        storeShotPresets(next)
+        session.presentControlNote("Saved $name")
+    }
+
+    override fun updateGimbalShotPreset(id: String) {
+        if (syncShotPresets() == null) return
+        val preset = _shotPresets.value.firstOrNull { it.id == id } ?: return
+        val pose = session.captureSteadyGimbalPose() ?: return
+        storeShotPresets(GimbalShotPresets.replacePose(_shotPresets.value, id, pose))
+        session.presentControlNote("Updated ${preset.name}")
+    }
+
+    override fun renameGimbalShotPreset(id: String, name: String) {
+        if (syncShotPresets() == null) return
+        storeShotPresets(GimbalShotPresets.rename(_shotPresets.value, id, name))
+    }
+
+    override fun deleteGimbalShotPreset(id: String) {
+        if (syncShotPresets() == null) return
+        storeShotPresets(GimbalShotPresets.remove(_shotPresets.value, id))
+    }
+
+    override fun moveGimbalShotPreset(id: String, delta: Int) {
+        if (syncShotPresets() == null) return
+        storeShotPresets(GimbalShotPresets.move(_shotPresets.value, id, delta))
+    }
+
+    override fun recallGimbalShotPreset(id: String) {
+        if (operatorSession.locked) return
+        syncShotPresets()
+        val preset = _shotPresets.value.firstOrNull { it.id == id } ?: return
+        session.recallGimbalPreset(preset.pose, _shotTravel.value, preset.name)
+    }
+
+    override fun setShotTravelSeconds(seconds: Double) {
+        if (!seconds.isFinite()) return
+        val clean = seconds.coerceIn(GimbalShotPresets.travelStops.first(), GimbalShotPresets.travelStops.last())
+        _shotTravel.value = clean
+        shotPrefs.edit().putFloat(SHOT_TRAVEL_KEY, clean.toFloat()).apply()
+    }
+
     // GamepadHost (camera-controls): the gamepad driver reaches the session through these.
     override val lastGimbalLimitContact get() = session.lastGimbalLimitContact
     override val zoomReadout get() = session.zoomReadout.value
@@ -702,6 +786,9 @@ class AppModel(
 
     companion object {
         const val CAMERAS = "openpocketcine.cameras"
+        const val SHOT_PRESETS = "openpocketcine.shot-presets"
+        const val SHOT_LIST_KEY = "shots"
+        const val SHOT_TRAVEL_KEY = "travel-seconds"
 
         /**
          * main's write notes come from the session's own send path: the camera's message on a

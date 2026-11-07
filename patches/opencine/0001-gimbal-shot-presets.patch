@@ -1,0 +1,780 @@
+From 18873fd1c39d1348d42819e496e887243eec54a8 Mon Sep 17 00:00:00 2001
+From: Davide Frangione <frangionedavide@gmail.com>
+Date: Sat, 7 Nov 2026 21:25:34 +0100
+Subject: [PATCH] feat: gimbal shot presets
+
+---
+ .../cameracontrols/GimbalShotPresets.kt       |  89 +++++++
+ .../cameracontrols/LiveGimbalChrome.kt        | 248 +++++++++++++++++-
+ .../cameracontrols/GimbalShotPresetsTest.kt   |  57 ++++
+ .../opencine/motion/GimbalProgram.kt          |   3 +
+ .../opencapture/opencine/dji/GimbalProgram.kt |   9 +-
+ .../opencine/dji/PocketCameraSession.kt       | 125 +++++++--
+ .../dji/GimbalShotPresetEngineTest.kt         |  48 ++++
+ 7 files changed, 552 insertions(+), 27 deletions(-)
+ create mode 100644 Android/camera-controls/src/main/kotlin/com/opencapture/opencine/cameracontrols/GimbalShotPresets.kt
+ create mode 100644 Android/camera-controls/src/test/kotlin/com/opencapture/opencine/cameracontrols/GimbalShotPresetsTest.kt
+ create mode 100644 Android/dji/src/test/kotlin/com/opencapture/opencine/dji/GimbalShotPresetEngineTest.kt
+
+diff --git a/Android/camera-controls/src/main/kotlin/com/opencapture/opencine/cameracontrols/GimbalShotPresets.kt b/Android/camera-controls/src/main/kotlin/com/opencapture/opencine/cameracontrols/GimbalShotPresets.kt
+new file mode 100644
+index 00000000..d945bf14
+--- /dev/null
++++ b/Android/camera-controls/src/main/kotlin/com/opencapture/opencine/cameracontrols/GimbalShotPresets.kt
+@@ -0,0 +1,89 @@
++package com.opencapture.opencine.cameracontrols
++
++import com.opencapture.opencine.motion.GimbalWaypoint
++import java.util.Locale
++
++/**
++ * One saved framing: pan, tilt and zoom the operator can recall with a tap. Angles are the
++ * gimbal's joint angles, so a shot stays valid only while the handle has not moved.
++ */
++data class GimbalShotPreset(
++    val id: String,
++    val name: String,
++    val pose: GimbalWaypoint,
++) {
++    val readout: String
++        get() = String.format(Locale.US, "PAN %+.0f°  TILT %+.0f°  %.1f×", pose.yawDeg, pose.pitchDeg, pose.zoom)
++}
++
++/** Pure list rules and a line codec for shot presets; storage is the app's. */
++object GimbalShotPresets {
++    const val MAX_PRESETS: Int = 12
++    const val MAX_NAME_LENGTH: Int = 24
++    const val DEFAULT_TRAVEL_SECONDS: Double = 3.0
++    val travelStops: List<Double> = listOf(1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 20.0)
++
++    private const val VERSION = "v1"
++
++    fun cleanName(raw: String): String =
++        raw.replace(Regex("[\\t\\r\\n]"), " ").trim().take(MAX_NAME_LENGTH)
++
++    /** "Shot N" with the lowest N not already used. */
++    fun nextDefaultName(presets: List<GimbalShotPreset>): String {
++        val used = presets.map { it.name }.toSet()
++        var n = 1
++        while ("Shot $n" in used) n += 1
++        return "Shot $n"
++    }
++
++    fun add(presets: List<GimbalShotPreset>, preset: GimbalShotPreset): List<GimbalShotPreset>? =
++        if (presets.size >= MAX_PRESETS) null else presets + preset
++
++    fun replacePose(presets: List<GimbalShotPreset>, id: String, pose: GimbalWaypoint): List<GimbalShotPreset> =
++        presets.map { if (it.id == id) it.copy(pose = pose) else it }
++
++    fun rename(presets: List<GimbalShotPreset>, id: String, name: String): List<GimbalShotPreset> {
++        val clean = cleanName(name)
++        if (clean.isEmpty()) return presets
++        return presets.map { if (it.id == id) it.copy(name = clean) else it }
++    }
++
++    fun remove(presets: List<GimbalShotPreset>, id: String): List<GimbalShotPreset> = presets.filterNot { it.id == id }
++
++    fun move(presets: List<GimbalShotPreset>, id: String, delta: Int): List<GimbalShotPreset> {
++        val from = presets.indexOfFirst { it.id == id }
++        if (from < 0) return presets
++        val to = (from + delta).coerceIn(0, presets.lastIndex)
++        if (to == from) return presets
++        return presets.toMutableList().apply { add(to, removeAt(from)) }
++    }
++
++    fun encode(presets: List<GimbalShotPreset>): String = buildString {
++        append(VERSION).append('\n')
++        for (p in presets) {
++            append(listOf(
++                p.id, cleanName(p.name), p.pose.yawDeg.toString(), p.pose.pitchDeg.toString(),
++                p.pose.zoom.toString(), p.pose.nativePitchDeg?.toString() ?: "",
++            ).joinToString("\t")).append('\n')
++        }
++    }
++
++    /** Unreadable lines are dropped rather than failing the whole list. */
++    fun decode(text: String?): List<GimbalShotPreset> {
++        if (text.isNullOrBlank()) return emptyList()
++        val lines = text.split('\n')
++        if (lines.firstOrNull()?.trim() != VERSION) return emptyList()
++        return lines.drop(1).mapNotNull { line ->
++            val f = line.split('\t')
++            if (f.size < 6) return@mapNotNull null
++            val yaw = f[2].toDoubleOrNull() ?: return@mapNotNull null
++            val pitch = f[3].toDoubleOrNull() ?: return@mapNotNull null
++            val zoom = f[4].toDoubleOrNull() ?: return@mapNotNull null
++            val native = if (f[5].isEmpty()) null else (f[5].toDoubleOrNull() ?: return@mapNotNull null)
++            if (!yaw.isFinite() || !pitch.isFinite() || !zoom.isFinite() || native?.isFinite() == false) return@mapNotNull null
++            val name = cleanName(f[1]).ifEmpty { return@mapNotNull null }
++            if (f[0].isBlank()) return@mapNotNull null
++            GimbalShotPreset(f[0], name, GimbalWaypoint(yaw, pitch, zoom, native))
++        }.distinctBy { it.id }.take(MAX_PRESETS)
++    }
++}
+diff --git a/Android/camera-controls/src/main/kotlin/com/opencapture/opencine/cameracontrols/LiveGimbalChrome.kt b/Android/camera-controls/src/main/kotlin/com/opencapture/opencine/cameracontrols/LiveGimbalChrome.kt
+index a3559c54..8be61efe 100644
+--- a/Android/camera-controls/src/main/kotlin/com/opencapture/opencine/cameracontrols/LiveGimbalChrome.kt
++++ b/Android/camera-controls/src/main/kotlin/com/opencapture/opencine/cameracontrols/LiveGimbalChrome.kt
+@@ -2,6 +2,11 @@ package com.opencapture.opencine.cameracontrols
+ 
+ import androidx.compose.foundation.Canvas
+ import androidx.compose.foundation.background
++import androidx.compose.foundation.text.BasicTextField
++import androidx.compose.foundation.text.KeyboardActions
++import androidx.compose.foundation.text.KeyboardOptions
++import androidx.compose.ui.graphics.SolidColor
++import androidx.compose.ui.text.input.ImeAction
+ import androidx.compose.foundation.gestures.awaitEachGesture
+ import androidx.compose.foundation.gestures.awaitFirstDown
+ import androidx.compose.foundation.layout.Arrangement
+@@ -101,6 +106,7 @@ import kotlin.math.max
+ import kotlin.math.min
+ import kotlin.math.roundToInt
+ import kotlinx.coroutines.delay
++import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.StateFlow
+ import kotlinx.coroutines.withTimeoutOrNull
+ 
+@@ -149,13 +155,29 @@ interface GimbalChromeHost {
+     fun pauseProgrammedMove()
+     fun resumeProgrammedMove()
+     fun cancelProgrammedMove()
++
++    /** Shot presets: saved framings recalled with one tap. Hosts without them keep these defaults. */
++    val supportsShotPresets: Boolean get() = false
++    val gimbalShotPresets: StateFlow<List<GimbalShotPreset>> get() = NoShotPresets
++    val shotTravelSeconds: StateFlow<Double> get() = NoShotTravel
++    fun saveGimbalShotPreset() {}
++    fun updateGimbalShotPreset(id: String) {}
++    fun renameGimbalShotPreset(id: String, name: String) {}
++    fun deleteGimbalShotPreset(id: String) {}
++    fun moveGimbalShotPreset(id: String, delta: Int) {}
++    fun recallGimbalShotPreset(id: String) {}
++    fun setShotTravelSeconds(seconds: Double) {}
+ }
+ 
++private val NoShotPresets: StateFlow<List<GimbalShotPreset>> = MutableStateFlow(emptyList())
++private val NoShotTravel: StateFlow<Double> = MutableStateFlow(GimbalShotPresets.DEFAULT_TRAVEL_SECONDS)
++
+ enum class LiveGimbalPanel {
+     NONE,
+     SHEET,
+     EDITOR,
+     RUN_PILL,
++    SHOTS,
+ }
+ 
+ private const val EDITOR_WIDTH_DP = 340f
+@@ -227,6 +249,27 @@ fun LiveGimbalSheetHost(
+         safeTop = safeTop,
+         safeBottom = safeBottom,
+         footer = {
++          Column {
++            if (model.supportsShotPresets) {
++                val shots by model.gimbalShotPresets.collectAsState()
++                Row(
++                    Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 7.dp)
++                        .background(LiveDesign.accentDim, RoundedCornerShape(10.dp))
++                        .testTag("shots.open")
++                        .chromeClickable {
++                            applyIfCurrent { model.liveGimbalPanel = LiveGimbalPanel.SHOTS }
++                        }
++                        .padding(horizontal = 12.dp, vertical = 13.dp),
++                    verticalAlignment = Alignment.CenterVertically,
++                ) {
++                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
++                        Text("Shots", style = LiveType.ui(11.5f, FontWeight.SemiBold))
++                        Text(if (shots.isEmpty()) "Save framings and recall them" else "${shots.size} saved",
++                            color = LiveDesign.muted, style = LiveType.ui(9f))
++                    }
++                    MonitorIcon(MonitorIcon.CHEVRON_RIGHT, null, Modifier.size(15.dp), LiveDesign.accent)
++                }
++            }
+             Row(
+                 Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 7.dp)
+                     .background(LiveDesign.accentDim, RoundedCornerShape(10.dp))
+@@ -242,6 +285,7 @@ fun LiveGimbalSheetHost(
+                 }
+                 MonitorIcon(MonitorIcon.CHEVRON_RIGHT, null, Modifier.size(15.dp), LiveDesign.accent)
+             }
++          }
+         },
+     ) {
+         Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+@@ -336,7 +380,7 @@ fun LiveGimbalOverlay(
+     val editorMaximumHeight = defaultEditor.height
+     val editorHeight = min(EDITOR_HEIGHT_DP, editorMaximumHeight)
+     val defaultTopCenter = Offset(defaultEditor.midX, defaultEditor.minY)
+-    Box(Modifier.fillMaxSize().zIndex(if (panel == LiveGimbalPanel.EDITOR) 1f else 0f)) {
++    Box(Modifier.fillMaxSize().zIndex(if (panel == LiveGimbalPanel.EDITOR || panel == LiveGimbalPanel.SHOTS) 1f else 0f)) {
+         if (panel == LiveGimbalPanel.EDITOR || panel == LiveGimbalPanel.RUN_PILL || running) {
+             LiveGimbalWaypointMarks(model, feed, program)
+         }
+@@ -359,6 +403,25 @@ fun LiveGimbalOverlay(
+                 LiveGimbalEditor(model, program, running, maxWidthDp = bounds.width, maxHeightDp = editorMaximumHeight)
+             }
+         }
++        if (panel == LiveGimbalPanel.SHOTS) {
++            MonitorMotionDismissBackdrop(
++                viewport = Rect(0f, 0f, layout.viewportWidth, layout.viewportHeight),
++                excluding = listOf(joystickBounds, zoomBounds).map { rect ->
++                    Rect(rect.minX, rect.minY, rect.minX + rect.width, rect.minY + rect.height)
++                },
++                onDismiss = { model.liveGimbalPanel = LiveGimbalPanel.NONE },
++            )
++            GimbalFloatMove(
++                model = model,
++                sizeHintW = min(EDITOR_WIDTH_DP, bounds.width),
++                sizeHintH = editorHeight,
++                bounds = bounds,
++                defaultTopCenter = defaultTopCenter,
++                identity = Triple(panel, cameraId, phase),
++            ) {
++                LiveGimbalShots(model, running, maxWidthDp = bounds.width, maxHeightDp = editorMaximumHeight)
++            }
++        }
+         if (panel == LiveGimbalPanel.RUN_PILL) {
+             GimbalFloatMove(
+                 model = model,
+@@ -897,3 +960,186 @@ private suspend fun PointerInputScope.detectHoldThenDragAllowClicks(
+         }
+     }
+ }
++
++/**
++ * Shot presets: tap a saved framing and the gimbal travels there over the chosen time. The
++ * joystick and zoom stay usable behind the panel, so the operator frames first, then saves.
++ */
++@Composable
++private fun LiveGimbalShots(model: GimbalChromeHost, running: Boolean, maxWidthDp: Float, maxHeightDp: Float) {
++    val presets by model.gimbalShotPresets.collectAsState()
++    val travel by model.shotTravelSeconds.collectAsState()
++    var editing by remember { mutableStateOf<String?>(null) }
++    var renaming by remember { mutableStateOf<String?>(null) }
++    var draft by remember { mutableStateOf("") }
++    val scroll = rememberScrollState()
++    val full = presets.size >= GimbalShotPresets.MAX_PRESETS
++    Column(
++        Modifier
++            .width(min(EDITOR_WIDTH_DP, maxWidthDp).dp)
++            .height(min(EDITOR_HEIGHT_DP, maxHeightDp).dp)
++            .testTag("shots.panel")
++            .monitorMaterial(MonitorMaterial.Expanded, RoundedCornerShape(16.dp)),
++    ) {
++        Row(Modifier.fillMaxWidth().height(48.dp).padding(horizontal = 12.dp),
++            verticalAlignment = Alignment.CenterVertically) {
++            Text("SHOTS", color = LiveDesign.text,
++                style = LiveType.ui(9f, FontWeight.SemiBold).copy(letterSpacing = 1.6.sp),
++                modifier = Modifier.weight(1f))
++            LivePopupCloseButton(
++                onClick = { model.liveGimbalPanel = LiveGimbalPanel.NONE },
++                size = 30.dp,
++                modifier = Modifier.testTag("shots.close"),
++            )
++        }
++        Column(
++            Modifier.weight(1f).fillMaxWidth()
++                .monitorScrollFade(scroll)
++                .verticalScroll(scroll)
++                .padding(horizontal = 12.dp, vertical = 4.dp),
++            verticalArrangement = Arrangement.spacedBy(7.dp),
++        ) {
++            if (presets.isEmpty()) {
++                Text("Frame the shot with the joystick and zoom, then tap Save. Keep the camera on a fixed " +
++                    "mount: shots are relative to the handle.",
++                    color = LiveDesign.secondary, style = LiveType.ui(10.5f),
++                    modifier = Modifier.padding(vertical = 8.dp))
++            }
++            presets.forEachIndexed { index, preset ->
++                key(preset.id) {
++                    MonitorOptionGroup {
++                        Row(verticalAlignment = Alignment.CenterVertically,
++                            horizontalArrangement = Arrangement.spacedBy(6.dp)) {
++                            Box(Modifier.size(24.dp).background(LiveDesign.accentDim, CircleShape),
++                                contentAlignment = Alignment.Center) {
++                                Text("${index + 1}", color = LiveDesign.accent, style = LiveType.ui(10f, FontWeight.Bold))
++                            }
++                            Column(
++                                Modifier.weight(1f).heightIn(min = 44.dp)
++                                    .testTag("shots.recall.${index + 1}")
++                                    .chromeClickable(onClick = {
++                                        editing = null
++                                        model.recallGimbalShotPreset(preset.id)
++                                    })
++                                    .semantics {
++                                        contentDescription = "Go to ${preset.name}"
++                                        role = Role.Button
++                                    },
++                                verticalArrangement = Arrangement.Center,
++                            ) {
++                                Text(preset.name, color = LiveDesign.text, maxLines = 1,
++                                    style = LiveType.ui(13f, FontWeight.SemiBold))
++                                Text(preset.readout, color = LiveDesign.muted, maxLines = 1,
++                                    style = LiveType.ui(9f, FontWeight.Medium))
++                            }
++                            Box(Modifier.size(44.dp)
++                                .testTag("shots.more.${index + 1}")
++                                .chromeClickable(onClick = {
++                                    editing = if (editing == preset.id) null else preset.id
++                                    renaming = null
++                                }),
++                                contentAlignment = Alignment.Center) {
++                                MonitorIcon(MonitorIcon.ELLIPSIS, contentDescription = "Edit ${preset.name}",
++                                    modifier = Modifier.size(15.dp), tint = LiveDesign.text)
++                            }
++                        }
++                        if (editing == preset.id) {
++                            if (renaming == preset.id) {
++                                Row(Modifier.fillMaxWidth().padding(bottom = 7.dp),
++                                    verticalAlignment = Alignment.CenterVertically,
++                                    horizontalArrangement = Arrangement.spacedBy(6.dp)) {
++                                    BasicTextField(
++                                        value = draft,
++                                        onValueChange = { draft = it.take(GimbalShotPresets.MAX_NAME_LENGTH) },
++                                        singleLine = true,
++                                        textStyle = LiveType.ui(13f).copy(color = LiveDesign.text),
++                                        cursorBrush = SolidColor(LiveDesign.accent),
++                                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
++                                        keyboardActions = KeyboardActions(onDone = {
++                                            model.renameGimbalShotPreset(preset.id, draft)
++                                            renaming = null
++                                        }),
++                                        modifier = Modifier.weight(1f)
++                                            .background(LiveDesign.glassBright, RoundedCornerShape(8.dp))
++                                            .padding(horizontal = 10.dp, vertical = 10.dp)
++                                            .testTag("shots.name"),
++                                    )
++                                    Chip("OK", selected = true, compact = true) {
++                                        model.renameGimbalShotPreset(preset.id, draft)
++                                        renaming = null
++                                    }
++                                }
++                            } else {
++                                Row(Modifier.fillMaxWidth().padding(bottom = 7.dp),
++                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
++                                    verticalAlignment = Alignment.CenterVertically) {
++                                    Chip("Update", selected = false, compact = true, enabled = !running) {
++                                        model.updateGimbalShotPreset(preset.id)
++                                    }
++                                    Chip("Rename", selected = false, compact = true) {
++                                        draft = preset.name
++                                        renaming = preset.id
++                                    }
++                                    Spacer(Modifier.weight(1f))
++                                    Box(Modifier.size(36.dp).chromeClickable(enabled = index > 0,
++                                        onClick = { model.moveGimbalShotPreset(preset.id, -1) }),
++                                        contentAlignment = Alignment.Center) {
++                                        MonitorIcon(MonitorIcon.CHEVRON_UP, contentDescription = "Move up",
++                                            modifier = Modifier.size(14.dp).alpha(if (index > 0) 1f else .35f),
++                                            tint = LiveDesign.text)
++                                    }
++                                    Box(Modifier.size(36.dp).chromeClickable(enabled = index < presets.lastIndex,
++                                        onClick = { model.moveGimbalShotPreset(preset.id, 1) }),
++                                        contentAlignment = Alignment.Center) {
++                                        MonitorIcon(MonitorIcon.CHEVRON_DOWN, contentDescription = "Move down",
++                                            modifier = Modifier.size(14.dp).alpha(if (index < presets.lastIndex) 1f else .35f),
++                                            tint = LiveDesign.text)
++                                    }
++                                    Box(Modifier.size(36.dp).chromeClickable(onClick = {
++                                        editing = null
++                                        model.deleteGimbalShotPreset(preset.id)
++                                    }), contentAlignment = Alignment.Center) {
++                                        MonitorIcon(MonitorIcon.TRASH, contentDescription = "Delete ${preset.name}",
++                                            modifier = Modifier.size(14.dp), tint = LiveDesign.destructive)
++                                    }
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
++            verticalAlignment = Alignment.CenterVertically) {
++            Text("Travel time", color = LiveDesign.muted, style = LiveType.ui(10f, FontWeight.SemiBold),
++                modifier = Modifier.weight(1f))
++            val stops = GimbalShotPresets.travelStops
++            val current = stops.indexOfFirst { it >= travel - 1e-6 }.let { if (it < 0) stops.lastIndex else it }
++            Box(Modifier.size(36.dp).testTag("shots.travel.minus")
++                .chromeClickable(enabled = current > 0, onClick = { model.setShotTravelSeconds(stops[current - 1]) }),
++                contentAlignment = Alignment.Center) {
++                Text("−", color = LiveDesign.text, style = LiveType.ui(16f, FontWeight.Bold))
++            }
++            Text(GimbalProgram.durationLabel(travel), color = LiveDesign.text,
++                style = LiveType.mono(13f, FontWeight.SemiBold), modifier = Modifier.widthIn(min = 40.dp))
++            Box(Modifier.size(36.dp).testTag("shots.travel.plus")
++                .chromeClickable(enabled = current < stops.lastIndex, onClick = { model.setShotTravelSeconds(stops[current + 1]) }),
++                contentAlignment = Alignment.Center) {
++                Text("+", color = LiveDesign.text, style = LiveType.ui(16f, FontWeight.Bold))
++            }
++        }
++        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
++            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++            if (running) {
++                Chip("Stop", selected = true, modifier = Modifier.weight(1f).height(44.dp).testTag("shots.stop")) {
++                    model.cancelProgrammedMove()
++                }
++            } else {
++                Chip(if (full) "Limit reached" else "Save current framing", selected = !full,
++                    enabled = !full, modifier = Modifier.weight(1f).height(44.dp).testTag("shots.save")) {
++                    model.saveGimbalShotPreset()
++                }
++            }
++        }
++    }
++}
+diff --git a/Android/camera-controls/src/test/kotlin/com/opencapture/opencine/cameracontrols/GimbalShotPresetsTest.kt b/Android/camera-controls/src/test/kotlin/com/opencapture/opencine/cameracontrols/GimbalShotPresetsTest.kt
+new file mode 100644
+index 00000000..2b0e448f
+--- /dev/null
++++ b/Android/camera-controls/src/test/kotlin/com/opencapture/opencine/cameracontrols/GimbalShotPresetsTest.kt
+@@ -0,0 +1,57 @@
++package com.opencapture.opencine.cameracontrols
++
++import com.opencapture.opencine.motion.GimbalWaypoint
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertNull
++import kotlin.test.assertTrue
++
++class GimbalShotPresetsTest {
++    private fun preset(id: String, name: String = "Shot $id", yaw: Double = 10.0) =
++        GimbalShotPreset(id, name, GimbalWaypoint(yaw, -5.5, 2.0, -12.25))
++
++    @Test
++    fun roundTripKeepsEveryField() {
++        val list = listOf(preset("a", "Palco"), GimbalShotPreset("b", "Pubblico", GimbalWaypoint(-40.0, 12.0, 1.0, null)))
++        assertEquals(list, GimbalShotPresets.decode(GimbalShotPresets.encode(list)))
++    }
++
++    @Test
++    fun namesCannotBreakTheLineFormat() {
++        val list = listOf(preset("a", "Pal\tco\nnuovo"))
++        val decoded = GimbalShotPresets.decode(GimbalShotPresets.encode(list))
++        assertEquals("Pal co nuovo", decoded.single().name)
++    }
++
++    @Test
++    fun corruptOrForeignTextIsIgnored() {
++        assertTrue(GimbalShotPresets.decode(null).isEmpty())
++        assertTrue(GimbalShotPresets.decode("garbage").isEmpty())
++        val text = "v1\na\tOk\t1\t2\t1\t\nb\tBad\tx\t2\t1\t\nc\tNaN\tNaN\t2\t1\t\n"
++        assertEquals(listOf("a"), GimbalShotPresets.decode(text).map { it.id })
++    }
++
++    @Test
++    fun addStopsAtTheLimit() {
++        var list = emptyList<GimbalShotPreset>()
++        repeat(GimbalShotPresets.MAX_PRESETS) { list = GimbalShotPresets.add(list, preset("$it"))!! }
++        assertNull(GimbalShotPresets.add(list, preset("x")))
++    }
++
++    @Test
++    fun defaultNamesFillGaps() {
++        assertEquals("Shot 1", GimbalShotPresets.nextDefaultName(emptyList()))
++        assertEquals("Shot 2", GimbalShotPresets.nextDefaultName(listOf(preset("1", "Shot 1"), preset("3", "Shot 3"))))
++    }
++
++    @Test
++    fun renameReplaceRemoveAndMove() {
++        val list = listOf(preset("a"), preset("b"), preset("c"))
++        assertEquals("Palco", GimbalShotPresets.rename(list, "b", "  Palco ")[1].name)
++        assertEquals(list, GimbalShotPresets.rename(list, "b", "   "))
++        assertEquals(99.0, GimbalShotPresets.replacePose(list, "c", GimbalWaypoint(99.0, 0.0, 1.0))[2].pose.yawDeg)
++        assertEquals(listOf("a", "c"), GimbalShotPresets.remove(list, "b").map { it.id })
++        assertEquals(listOf("b", "a", "c"), GimbalShotPresets.move(list, "b", -1).map { it.id })
++        assertEquals(list, GimbalShotPresets.move(list, "c", 1))
++    }
++}
+diff --git a/Android/core/src/main/kotlin/com/opencapture/opencine/motion/GimbalProgram.kt b/Android/core/src/main/kotlin/com/opencapture/opencine/motion/GimbalProgram.kt
+index 376f6cc5..ce119426 100644
+--- a/Android/core/src/main/kotlin/com/opencapture/opencine/motion/GimbalProgram.kt
++++ b/Android/core/src/main/kotlin/com/opencapture/opencine/motion/GimbalProgram.kt
+@@ -25,6 +25,8 @@ public data class GimbalProgram(
+     public val durationBC: Double = DEFAULT_DURATION,
+     public val smoothness: Double = 0.0,
+     public val loop: Boolean = false,
++    /** Settle at A before the pass. Shot presets start from the live pose and skip most of it. */
++    public val holdSeconds: Double = DEFAULT_HOLD_SECONDS,
+ ) {
+     public val canRun: Boolean get() = a != null && b != null
+     public val changesZoom: Boolean
+@@ -87,6 +89,7 @@ public data class GimbalProgram(
+         public const val MIN_DURATION: Double = 0.5
+         public const val MAX_DURATION: Double = 120.0
+         public const val DEFAULT_DURATION: Double = 5.0
++        public const val DEFAULT_HOLD_SECONDS: Double = 2.0
+         public val durationStops: List<Double> = listOf(2.0, 5.0, 10.0)
+ 
+         public fun snapDuration(value: Double): Double {
+diff --git a/Android/dji/src/main/kotlin/com/opencapture/opencine/dji/GimbalProgram.kt b/Android/dji/src/main/kotlin/com/opencapture/opencine/dji/GimbalProgram.kt
+index 2c34d908..6e3e6183 100644
+--- a/Android/dji/src/main/kotlin/com/opencapture/opencine/dji/GimbalProgram.kt
++++ b/Android/dji/src/main/kotlin/com/opencapture/opencine/dji/GimbalProgram.kt
+@@ -267,6 +267,7 @@ class GimbalMoveEngine {
+             return false
+         }
+         if (!program.smoothness.isFinite() || program.smoothness !in 0.0..1.0) return false
++        if (!program.holdSeconds.isFinite() || program.holdSeconds !in 0.0..GimbalProgram.DEFAULT_HOLD_SECONDS) return false
+         val points = listOfNotNull(program.a, program.b, live, program.c)
+         if (!points.all {
+                 it.yawDeg.isFinite() && it.pitchDeg.isFinite() && it.zoom.isFinite() && it == it.clamped() &&
+@@ -382,7 +383,7 @@ class GimbalMoveEngine {
+                 val boundary = min(nextCurveCommand, legs[index].duration)
+                 return if (boundary > elapsed + 1e-9) min(0.04, boundary - elapsed) else 0.04
+             }
+-            val end = if (phase == "RUN") legs[index].duration else if (phase == "HOLD") HOLD_SECONDS else 0.0
++            val end = if (phase == "RUN") legs[index].duration else if (phase == "HOLD") program.holdSeconds else 0.0
+             return if (end > elapsed) min(0.04, end - elapsed) else 0.04
+         }
+ 
+@@ -437,7 +438,7 @@ class GimbalMoveEngine {
+         }
+         if (phase == "HOLD") {
+             if (angularDistance(live, a) > ARRIVE_DEG) return stop(live, "Camera moved before the take")
+-            if (elapsed + 1e-9 < HOLD_SECONDS) return output(live)
++            if (elapsed + 1e-9 < program.holdSeconds) return output(live)
+             return beginPassMotion(live)
+         }
+         if (phase == "RUN") curve?.let { return tickCurve(it, live) }
+@@ -711,7 +712,7 @@ class GimbalMoveEngine {
+         val atA = phase == "APPROACH" || phase == "HOLD"
+         val target = if (atA) legs[0].from else leg.to
+         return Readout(if (atA) "A" else leg.label, if (isPaused) "PAUSED" else phase,
+-            if (phase == "APPROACH") approachDuration else if (phase == "HOLD") HOLD_SECONDS else leg.duration,
++            if (phase == "APPROACH") approachDuration else if (phase == "HOLD") program.holdSeconds else leg.duration,
+             if (phase == "VERIFY" || phase == "DONE") leg.duration
+             else if (curve != null && phase == "RUN" && index == 1) elapsed - curve!!.durationAB else elapsed,
+             live.yawDeg, live.pitchDeg, target.yawDeg, target.pitchDeg, angularDistance(live, target))
+@@ -724,7 +725,7 @@ class GimbalMoveEngine {
+ 
+     companion object {
+         const val ARRIVE_DEG = 0.15
+-        const val HOLD_SECONDS = 2.0
++        const val HOLD_SECONDS = GimbalProgram.DEFAULT_HOLD_SECONDS
+         fun canSendNativeTarget(live: GimbalWaypoint, target: GimbalWaypoint): Boolean =
+             live.yawDeg.isFinite() && live.pitchDeg.isFinite() && target.yawDeg.isFinite() && target.pitchDeg.isFinite() &&
+                 live == live.clamped() && target == target.clamped() &&
+diff --git a/Android/dji/src/main/kotlin/com/opencapture/opencine/dji/PocketCameraSession.kt b/Android/dji/src/main/kotlin/com/opencapture/opencine/dji/PocketCameraSession.kt
+index f62335a8..1861deaa 100644
+--- a/Android/dji/src/main/kotlin/com/opencapture/opencine/dji/PocketCameraSession.kt
++++ b/Android/dji/src/main/kotlin/com/opencapture/opencine/dji/PocketCameraSession.kt
+@@ -5199,25 +5199,34 @@ class PocketCameraSession(
+     }
+ 
+     fun setGimbalWaypoint(slot: GimbalWaypointSlot) {
++        val point = captureSteadyGimbalPose() ?: return
++        _gimbalProgram.value = _gimbalProgram.value.withPoint(slot, point)
++    }
++
++    /**
++     * The settled live pan, tilt and zoom, or `null` with an operator note. Motion Control
++     * waypoints and shot presets share this capture rule.
++     */
++    fun captureSteadyGimbalPose(): GimbalWaypoint? {
+         val point = liveGimbalWaypoint
+         if (point == null || gimbalTelemetryAge() > 0.3) {
+             _controlNote.value = GimbalHudCopy.POSE_NOT_READY
+-            return
++            return null
+         }
+         if (point != point.clamped()) {
+             _controlNote.value = "Set the gimbal within its tilt limits"
+-            return
++            return null
+         }
+         if (point.nativePitchDeg == null) {
+             _controlNote.value = GimbalHudCopy.POSE_NOT_READY
+-            return
++            return null
+         }
+         if (gimbalStickHeld || moveDriving || captureStableSince == 0L ||
+             lastValidGimbalAttitudeAt - captureStableSince < 500) {
+             _controlNote.value = GimbalHudCopy.HOLD_STILL
+-            return
++            return null
+         }
+-        _gimbalProgram.value = _gimbalProgram.value.withPoint(slot, point)
++        return point
+     }
+ 
+     fun clearGimbalWaypoint(slot: GimbalWaypointSlot) {
+@@ -5311,25 +5320,95 @@ class PocketCameraSession(
+                 return@launch
+             }
+             prepProgrammedMoveGimbal()
+-            moveToken = link.startNativeProgram(program) { progress ->
+-                if (moveDatalink !== link || moveToken != progress.token) return@startNativeProgram
+-                _gimbalMovePaused.value = progress.paused
+-                progress.note?.let { _controlNote.value = it }
+-                lastMoveReadout = progress.readout
+-                publishMoveDebug(GimbalMoveEngine.formatDebug(progress.program, progress.live, progress.readout),
+-                    force = progress.finished)
+-                if (progress.finished) {
+-                    progress.failure?.let { _controlNote.value = it }
+-                    restGimbalStickWire()
+-                    gimbalRestedAt = SystemClock.elapsedRealtime()
+-                    _gimbalMoveRunning.value = false
+-                    _gimbalMovePaused.value = false
+-                    moveDriving = false
+-                    moveToken = null
+-                    moveDatalink = null
+-                }
++            startNativeTake(link, program)
++        }
++    }
++
++    private fun startNativeTake(link: DatalinkDriver, program: GimbalProgram, doneNote: String? = null) {
++        moveToken = link.startNativeProgram(program) { progress ->
++            if (moveDatalink !== link || moveToken != progress.token) return@startNativeProgram
++            _gimbalMovePaused.value = progress.paused
++            progress.note?.let { _controlNote.value = it }
++            lastMoveReadout = progress.readout
++            publishMoveDebug(GimbalMoveEngine.formatDebug(progress.program, progress.live, progress.readout),
++                force = progress.finished)
++            if (progress.finished) {
++                val failure = progress.failure
++                if (failure != null) _controlNote.value = failure
++                else if (doneNote != null) _controlNote.value = doneNote
++                restGimbalStickWire()
++                gimbalRestedAt = SystemClock.elapsedRealtime()
++                _gimbalMoveRunning.value = false
++                _gimbalMovePaused.value = false
++                moveDriving = false
++                moveToken = null
++                moveDatalink = null
++            }
++        }
++    }
++
++    /**
++     * Shot preset recall: one timed move from the live pose to [target] over [durationSeconds],
++     * with no countdown and a short settle. Pan, tilt and zoom are absolute to the handle, so a
++     * preset holds only while the handle stays where it was when the preset was saved.
++     */
++    fun recallGimbalPreset(target: GimbalWaypoint, durationSeconds: Double, name: String) {
++        if (!hasGimbal) return
++        if (_gimbalMoveRunning.value) cancelProgrammedMove()
++        if (!firstPictureSettled || decoder.lastPresentedAt == null || isLiveVideoStale()) {
++            _controlNote.value = "Wait for live video before recalling a shot"
++            return
++        }
++        val link = datalink ?: return
++        val feedback = link.latestNativeProgramFeedback
++        val live = liveGimbalWaypoint
++        if (feedback == null || live == null || live.nativePitchDeg == null ||
++            SystemClock.elapsedRealtimeNanos() / 1e9 - feedback.receivedAt !in 0.0..0.3) {
++            _controlNote.value = GimbalHudCopy.POSE_NOT_READY
++            return
++        }
++        if (target != target.clamped() || target.nativePitchDeg == null) {
++            _controlNote.value = "Save \"$name\" again: it is outside the gimbal limits"
++            return
++        }
++        val start = live.clamped()
++        var end = target
++        // Tiny readout differences must not turn a still lens into a zoom program.
++        if (abs(end.zoom - start.zoom) < PRESET_ZOOM_EPSILON) end = end.copy(zoom = start.zoom)
++        var program = GimbalProgram(a = start, b = end,
++            durationAB = GimbalProgram.snapDuration(durationSeconds), holdSeconds = PRESET_HOLD_SECONDS)
++        var note = "Shot: $name"
++        link.programmedZoomFailure(program)?.let {
++            // Keep the framing move; leave zoom where it is and say why.
++            program = program.copy(b = end.copy(zoom = start.zoom))
++            note = "Shot: $name (zoom unchanged: $it)"
++            if (link.programmedZoomFailure(program) != null) {
++                _controlNote.value = it
++                return
+             }
+         }
++        cancelProgrammedMove()
++        worldLevelSnap = null
++        endGimbalStick()
++        restGimbalStickWire()
++        zoomFlushJob?.cancel()
++        zoomFlushJob = null
++        discardPendingZoom()
++        discardZoomAfterHop()
++        zoomColorHopGeneration += 1
++        zoomColorHopPending = false
++        restoreDLog2OnWide = false
++        zoomPinchPreview = null
++        refreshZoomHud()
++        _gimbalMoveRunning.value = true
++        _gimbalMovePaused.value = false
++        moveDriving = true
++        lastMoveHudAt = 0L
++        lastMoveLogAt = 0L
++        lastMoveReadout = null
++        moveDatalink = link
++        prepProgrammedMoveGimbal()
++        startNativeTake(link, program, note)
+     }
+ 
+     fun pauseProgrammedMove() {
+@@ -6150,6 +6229,8 @@ class PocketCameraSession(
+     }
+ 
+     companion object {
++        const val PRESET_HOLD_SECONDS = 0.3
++        const val PRESET_ZOOM_EPSILON = 0.05
+         private const val TAG = "PocketCameraSession"
+         private const val IDENTITY_KEY = 0x0707
+         private const val STATION_FIND_MS = 60_000L
+diff --git a/Android/dji/src/test/kotlin/com/opencapture/opencine/dji/GimbalShotPresetEngineTest.kt b/Android/dji/src/test/kotlin/com/opencapture/opencine/dji/GimbalShotPresetEngineTest.kt
+new file mode 100644
+index 00000000..b7c84f59
+--- /dev/null
++++ b/Android/dji/src/test/kotlin/com/opencapture/opencine/dji/GimbalShotPresetEngineTest.kt
+@@ -0,0 +1,48 @@
++package com.opencapture.opencine.dji
++
++import com.opencapture.opencine.motion.GimbalProgram
++import com.opencapture.opencine.motion.GimbalWaypoint
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertNotNull
++import kotlin.test.assertTrue
++
++/** Shot preset recall: a program from the live pose with a short settle instead of the 2 s take hold. */
++class GimbalShotPresetEngineTest {
++    private val live = GimbalWaypoint(0.0, 0.0, 1.0, nativePitchDeg = 0.0)
++    private val shot = GimbalWaypoint(40.0, 10.0, 1.0, nativePitchDeg = -10.0)
++
++    private fun firstTargetTime(hold: Double): Double {
++        val engine = GimbalMoveEngine()
++        assertTrue(engine.start(GimbalProgram(a = live, b = shot, durationAB = 3.0, holdSeconds = hold), live))
++        var t = 0.0
++        while (t < 3.0) {
++            val out = engine.tick(0.04, live)
++            t += 0.04
++            if (out?.target != null) return t
++        }
++        error("no target")
++    }
++
++    @Test
++    fun presetHoldStartsTheMoveSoonerThanATake() {
++        val preset = firstTargetTime(PocketCameraSession.PRESET_HOLD_SECONDS)
++        val take = firstTargetTime(GimbalProgram.DEFAULT_HOLD_SECONDS)
++        assertTrue(preset < 0.5, "preset $preset")
++        assertTrue(take >= GimbalProgram.DEFAULT_HOLD_SECONDS, "take $take")
++    }
++
++    @Test
++    fun defaultHoldIsUnchanged() {
++        assertEquals(2.0, GimbalMoveEngine.HOLD_SECONDS)
++        assertEquals(2.0, GimbalProgram().holdSeconds)
++    }
++
++    @Test
++    fun invalidHoldIsRejected() {
++        assertFalse(GimbalMoveEngine().start(GimbalProgram(a = live, b = shot, holdSeconds = Double.NaN), live))
++        assertFalse(GimbalMoveEngine().start(GimbalProgram(a = live, b = shot, holdSeconds = -1.0), live))
++        assertNotNull(GimbalMoveEngine().takeIf { it.start(GimbalProgram(a = live, b = shot, holdSeconds = 0.0), live) })
++    }
++}
+-- 
+2.43.0
+
