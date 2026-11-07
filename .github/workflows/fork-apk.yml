@@ -19,7 +19,8 @@ concurrency:
 jobs:
   apk:
     name: Build debug APK
-    runs-on: ubuntu-latest
+    # Pinned: the Swift 6.3.3 toolchain is built for 24.04 (ubuntu-latest moved to 26 and lacks libxml2.so.2).
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
