@@ -1,5 +1,7 @@
 # Modifiche in attesa (prossimo aggiornamento)
 
+_Già applicato fuori lista: collegamento al router per la Pocket 4P (risposta `E0` alla domanda sulla modalità Wi-Fi), con registro delle risposte._
+
 Lista raccolta per un unico aggiornamento. Si applica tutto insieme quando Davide dice "procedi".
 
 1. **Zoom 1× 3× 6× ad arco attorno al joystick.**

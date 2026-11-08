@@ -1,0 +1,81 @@
+From e5221edef392845f20f1ba69367ccd1a81e76087 Mon Sep 17 00:00:00 2001
+From: Davide Frangione <frangionedavide@gmail.com>
+Date: Sun, 8 Nov 2026 19:14:54 +0100
+Subject: [PATCH] fix: Pocket 4 Pro station setup accepts the E0 role reply;
+ log role replies
+
+---
+ .../main/kotlin/com/opencapture/opencine/dji/StationJoin.kt   | 3 ++-
+ Sources/OpenCineDJI/MulticamCommands.swift                    | 4 +++-
+ Tests/OpenCineDJIAndroidTests/DjiNativeWireTests.swift        | 2 +-
+ Tests/OpenCineDJITests/MulticamTests.swift                    | 4 ++--
+ 4 files changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/Android/dji/src/main/kotlin/com/opencapture/opencine/dji/StationJoin.kt b/Android/dji/src/main/kotlin/com/opencapture/opencine/dji/StationJoin.kt
+index be96ee4e..ce6ee39b 100644
+--- a/Android/dji/src/main/kotlin/com/opencapture/opencine/dji/StationJoin.kt
++++ b/Android/dji/src/main/kotlin/com/opencapture/opencine/dji/StationJoin.kt
+@@ -99,7 +99,7 @@ class StationJoin(
+             JSONObject().put("reply", hex(role)).put("allowMissingQuery", allowMissing).toString(),
+         ) ?: "reject"
+         val missingRoleQuery = decision == "setWithoutReadback"
+-        log("station experimental=$experimental decision=$decision")
++        log("station experimental=$experimental role=${hex(role)} allowMissing=$allowMissing decision=$decision")
+         if (decision == "alreadyStation" && probeExistingStation && (!hotspot || hotspotReady())) {
+             status("Finding camera on Wi-Fi")
+             if (verifyOnNetwork()) return Outcome.VERIFIED
+@@ -111,6 +111,7 @@ class StationJoin(
+                 "acceptsSetter",
+                 JSONObject().put("reply", hex(switched)).put("missingQuery", missingRoleQuery).toString(),
+             ) == "true"
++            log("station role switch reply=${hex(switched)} accepted=$accepted")
+             if (!accepted) throw Failure.RoleRefused()
+             // The missing-getter shape has no readback; its join result and LAN identity
+             // check remain required.
+diff --git a/Sources/OpenCineDJI/MulticamCommands.swift b/Sources/OpenCineDJI/MulticamCommands.swift
+index f6e8ae1a..a2e7cd71 100644
+--- a/Sources/OpenCineDJI/MulticamCommands.swift
++++ b/Sources/OpenCineDJI/MulticamCommands.swift
+@@ -106,6 +106,8 @@ public enum MulticamSupport {
+ 
+     /// Pocket 3 and Nano answer the role getter with `e0`; verified on hardware only.
+     public static func acceptsMissingRoleQuery(_ model: CameraModel, reply: [UInt8]) -> Bool {
+-        (model.family == .nano || model.isPocket3) && reply == [0xe0]
++        // Nano and Pocket 3 were captured answering `E0`; a Pocket 4 Pro on newer firmware was
++        // refused here in the field (2026-11-08). The join reply and LAN identity still decide.
++        (model.family == .nano || model.family == .pocket || model.isPocket3) && reply == [0xe0]
+     }
+ }
+diff --git a/Tests/OpenCineDJIAndroidTests/DjiNativeWireTests.swift b/Tests/OpenCineDJIAndroidTests/DjiNativeWireTests.swift
+index 5038c972..d1f02e33 100644
+--- a/Tests/OpenCineDJIAndroidTests/DjiNativeWireTests.swift
++++ b/Tests/OpenCineDJIAndroidTests/DjiNativeWireTests.swift
+@@ -479,7 +479,7 @@ struct MulticamWireTests {
+                 == "unsupported")
+         #expect(
+             decide("support", #"{"modelId":34,"name":"Osmo Pocket 4 Pro"}"#)
+-                == #"{"appears":true,"preview":true,"missingRoleQueryE0":false}"#)
++                == #"{"appears":true,"preview":true,"missingRoleQueryE0":true}"#)
+         // JSONObject.quote escapes `/` as `\/`; the name still resolves.
+         #expect(
+             decide("support", #"{"name":"OsmoPocket3 \/ A"}"#)
+diff --git a/Tests/OpenCineDJITests/MulticamTests.swift b/Tests/OpenCineDJITests/MulticamTests.swift
+index f00c2549..4dde848f 100644
+--- a/Tests/OpenCineDJITests/MulticamTests.swift
++++ b/Tests/OpenCineDJITests/MulticamTests.swift
+@@ -118,10 +118,10 @@ struct MulticamSupportTests {
+         #expect(!MulticamSupport.hasPreview(oldPocket))
+     }
+ 
+-    @Test func missingRoleQueryOnlyForPocket3AndNanoE0() {
++    @Test func missingRoleQueryOnlyForPocketAndNanoE0() {
+         for (name, accepted) in [
+             ("OsmoPocket3-Test", true), ("OsmoNano-Test", true),
+-            ("OsmoPocket4P-Test", false), ("OsmoAction4-Test", false),
++            ("OsmoPocket4P-Test", true), ("OsmoAction4-Test", false),
+         ] {
+             let model = CameraModel.resolve(modelId: nil, name: name)
+             #expect(MulticamSupport.acceptsMissingRoleQuery(model, reply: [0xe0]) == accepted)
+-- 
+2.43.0
+
