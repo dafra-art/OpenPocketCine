@@ -47,6 +47,21 @@ jobs:
       - name: Install Swift Android SDK
         run: ./scripts/ci-install-swift-android.sh
 
+      # services.gradle.org sometimes times out at the wrapper's 10 s default: wait longer and retry.
+      - name: Download the Gradle distribution
+        working-directory: Apps/Android
+        run: |
+          set -uo pipefail
+          sed -i 's/^networkTimeout=.*/networkTimeout=120000/' gradle/wrapper/gradle-wrapper.properties
+          grep -q '^networkTimeout=' gradle/wrapper/gradle-wrapper.properties \
+            || echo 'networkTimeout=120000' >> gradle/wrapper/gradle-wrapper.properties
+          for attempt in 1 2 3 4 5; do
+            if ./gradlew --version; then exit 0; fi
+            echo "Gradle download attempt $attempt failed; retrying in 30 s"
+            sleep 30
+          done
+          exit 1
+
       - name: Use the fork's stable debug key
         run: |
           mkdir -p ~/.android
