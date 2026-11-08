@@ -7,7 +7,7 @@ saved framing over the chosen travel time (1–20 s) with no countdown.
 - Open the gimbal panel, then **Shots**.
 - Frame with the joystick and zoom (they stay usable while Shots is open), hold still,
   tap **Save current framing**.
-- Tap a shot to go there, or tap its letter (A, B, C…) in the column on the right of the live screen. **⋯** on a shot: Update (save the current framing into it),
+- Tap a shot to go there, or tap its letter (A, B, C…) in the column on the left of the live screen (sized so six fit, portrait or landscape). **⋯** on a shot: Update (save the current framing into it),
   Rename, move up/down, delete.
 - Shots are saved per camera and survive app restarts.
 - Keep the camera on a fixed mount: angles are relative to the handle.
