@@ -1,0 +1,110 @@
+From b8955b8cf2d51c12648a6810315305e11546a13e Mon Sep 17 00:00:00 2001
+From: Davide Frangione <frangionedavide@gmail.com>
+Date: Sun, 8 Nov 2026 09:06:37 +0100
+Subject: [PATCH 2/2] feat: one-tap shot buttons on the live screen
+
+---
+ .../cameracontrols/LiveGimbalChrome.kt        | 68 ++++++++++++++++++-
+ .../MonitorOperatorVocabularySurface.kt       |  3 +
+ 2 files changed, 70 insertions(+), 1 deletion(-)
+
+diff --git a/Android/camera-controls/src/main/kotlin/com/opencapture/opencine/cameracontrols/LiveGimbalChrome.kt b/Android/camera-controls/src/main/kotlin/com/opencapture/opencine/cameracontrols/LiveGimbalChrome.kt
+index 8be61efe..49514270 100644
+--- a/Android/camera-controls/src/main/kotlin/com/opencapture/opencine/cameracontrols/LiveGimbalChrome.kt
++++ b/Android/camera-controls/src/main/kotlin/com/opencapture/opencine/cameracontrols/LiveGimbalChrome.kt
+@@ -1012,7 +1012,7 @@ private fun LiveGimbalShots(model: GimbalChromeHost, running: Boolean, maxWidthD
+                             horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                             Box(Modifier.size(24.dp).background(LiveDesign.accentDim, CircleShape),
+                                 contentAlignment = Alignment.Center) {
+-                                Text("${index + 1}", color = LiveDesign.accent, style = LiveType.ui(10f, FontWeight.Bold))
++                                Text(gimbalShotLetter(index), color = LiveDesign.accent, style = LiveType.ui(10f, FontWeight.Bold))
+                             }
+                             Column(
+                                 Modifier.weight(1f).heightIn(min = 44.dp)
+@@ -1143,3 +1143,69 @@ private fun LiveGimbalShots(model: GimbalChromeHost, running: Boolean, maxWidthD
+         }
+     }
+ }
++
++/** Letter shown for the shot at [index]: A, B, C… in list order. */
++fun gimbalShotLetter(index: Int): String = ('A' + index.coerceIn(0, 25)).toString()
++
++/**
++ * One-tap shot buttons on the live screen: a column against the picture's trailing edge, below
++ * the top status deck and above the trailing gimbal cluster. Hidden until a shot is saved.
++ */
++@Composable
++fun LiveGimbalShotRail(model: GimbalChromeHost, layout: LiveMonitorLayout, cluster: GimbalCluster, locked: Boolean) {
++    if (!model.supportsShotPresets) return
++    val presets by model.gimbalShotPresets.collectAsState()
++    if (presets.isEmpty()) return
++    val running by model.gimbalMoveRunning.collectAsState()
++    val feed = layout.onFeed
++    val width = 58f
++    val top = max(feed.minY, max(layout.topDeck.maxY, layout.safeTop)) + 10f
++    val floor = if (!cluster.bounds.isEmpty && cluster.bounds.midX > feed.midX)
++        min(cluster.bounds.minY, cluster.headTrack.minY) else feed.maxY
++    val height = floor - 10f - top
++    if (height < 52f) return
++    val x = min(feed.maxX, layout.viewportWidth - layout.safeTrailing) - width - 10f
++    Column(
++        Modifier
++            .offset(x.dp, top.dp)
++            .size(width.dp, height.dp)
++            .verticalScroll(rememberScrollState())
++            .testTag("shots.rail")
++            .alpha(if (locked) .4f else 1f),
++        verticalArrangement = Arrangement.spacedBy(6.dp),
++    ) {
++        presets.forEachIndexed { index, preset ->
++            key(preset.id) {
++                Column(
++                    Modifier.fillMaxWidth().heightIn(min = 46.dp)
++                        .monitorGlass(RoundedCornerShape(12.dp))
++                        .testTag("shots.rail.${gimbalShotLetter(index)}")
++                        .chromeClickable(enabled = !locked, onClick = { model.recallGimbalShotPreset(preset.id) })
++                        .semantics {
++                            contentDescription = "Go to ${preset.name}"
++                            role = Role.Button
++                        }
++                        .padding(horizontal = 4.dp, vertical = 5.dp),
++                    horizontalAlignment = Alignment.CenterHorizontally,
++                    verticalArrangement = Arrangement.Center,
++                ) {
++                    Text(gimbalShotLetter(index), color = LiveDesign.accent,
++                        style = LiveType.ui(15f, FontWeight.Bold))
++                    Text(preset.name, color = LiveDesign.text, maxLines = 1,
++                        style = LiveType.ui(8.5f, FontWeight.Medium))
++                }
++            }
++        }
++        if (running) {
++            Box(
++                Modifier.fillMaxWidth().height(40.dp)
++                    .background(LiveDesign.destructive.copy(alpha = .85f), RoundedCornerShape(12.dp))
++                    .testTag("shots.rail.stop")
++                    .chromeClickable(onClick = { model.cancelProgrammedMove() }),
++                contentAlignment = Alignment.Center,
++            ) {
++                Text("STOP", color = LiveDesign.text, style = LiveType.ui(10f, FontWeight.Bold))
++            }
++        }
++    }
++}
+diff --git a/Android/camera-controls/src/main/kotlin/com/opencapture/opencine/cameracontrols/MonitorOperatorVocabularySurface.kt b/Android/camera-controls/src/main/kotlin/com/opencapture/opencine/cameracontrols/MonitorOperatorVocabularySurface.kt
+index ddb8091c..3df75c5d 100644
+--- a/Android/camera-controls/src/main/kotlin/com/opencapture/opencine/cameracontrols/MonitorOperatorVocabularySurface.kt
++++ b/Android/camera-controls/src/main/kotlin/com/opencapture/opencine/cameracontrols/MonitorOperatorVocabularySurface.kt
+@@ -287,6 +287,9 @@ private fun <Host> MonitorOperatorNativeControls(source: MonitorOperatorLiveChro
+                     LiveGimbalPanel.NONE else LiveGimbalPanel.SHEET
+             }, Modifier.operatorFrame(cluster.controls).alpha(if (locked) .4f else 1f))
+         }
++        if (!capturePresented && showGimbal && shell.cover == null) {
++            LiveGimbalShotRail(source.host, layout, cluster, locked || !interactive)
++        }
+         if (showGimbal && !cluster.stick.isEmpty) {
+             Box(Modifier.operatorFrame(cluster.stick).alpha(if (capturePresented) 0f else 1f)
+                 .monitorChromeEditStroke(editing, true)) {
+-- 
+2.43.0
+
