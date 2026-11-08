@@ -623,7 +623,8 @@ class AppModel(
         val pose = session.captureSteadyGimbalPose() ?: return
         val current = _shotPresets.value
         val name = GimbalShotPresets.nextDefaultName(current)
-        val next = GimbalShotPresets.add(current, GimbalShotPreset(java.util.UUID.randomUUID().toString(), name, pose))
+        val next = GimbalShotPresets.add(current,
+            GimbalShotPreset(java.util.UUID.randomUUID().toString(), name, pose, ShotCameraSettings.capture(session.status.value)))
         if (next == null) {
             session.presentControlNote("Up to ${GimbalShotPresets.MAX_PRESETS} shots per camera")
             return
@@ -636,7 +637,8 @@ class AppModel(
         if (syncShotPresets() == null) return
         val preset = _shotPresets.value.firstOrNull { it.id == id } ?: return
         val pose = session.captureSteadyGimbalPose() ?: return
-        storeShotPresets(GimbalShotPresets.replacePose(_shotPresets.value, id, pose))
+        storeShotPresets(GimbalShotPresets.replacePose(_shotPresets.value, id, pose,
+            ShotCameraSettings.capture(session.status.value)))
         session.presentControlNote("Updated ${preset.name}")
     }
 
@@ -659,7 +661,24 @@ class AppModel(
         if (operatorSession.locked) return
         syncShotPresets()
         val preset = _shotPresets.value.firstOrNull { it.id == id } ?: return
-        session.recallGimbalPreset(preset.pose, _shotTravel.value, preset.name)
+        val settings = preset.settings
+        val started = session.recallGimbalPreset(preset.pose, _shotTravel.value, preset.name, onArrived = {
+            ShotCameraSettings.focusPoint(settings)?.let { (x, y) -> session.focusAtPoint(x, y) }
+        })
+        if (started) ShotCameraSettings.apply(settings, session.status.value, shotSettingsWriter)
+    }
+
+    private val shotSettingsWriter = object : ShotCameraSettings.Writer {
+        override fun expoMode(mode: Int) = setExpoMode(mode)
+        override fun isoIndex(index: Int) = setIsoIndex(index)
+        override fun shutterDenom(denom: Int) = setShutterDenom(denom)
+        override fun ev(thirds: Int) = setEv(thirds)
+        override fun isoLimit(raw: Int) = setIsoLimit(raw)
+        override fun whiteBalanceAuto(tint: Int) = setWhiteBalanceAuto(tint)
+        override fun whiteBalance(kelvin: Int, tint: Int) = setWhiteBalance(kelvin, tint)
+        override fun aperture(raw: Int) = setApertureStrategy(raw)
+        override fun focusMode(continuous: Boolean) = setFocusMode(continuous)
+        override fun focusTrack(raw: Int) = setFocusTrack(raw)
     }
 
     override fun setShotTravelSeconds(seconds: Double) {

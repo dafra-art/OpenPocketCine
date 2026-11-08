@@ -17,3 +17,13 @@ saved framing over the chosen travel time (1–20 s) with no countdown.
 Build: the `Fork APK (shot presets)` workflow checks out upstream OpenCine at the pin,
 applies `patches/opencine/*.patch`, and uploads a debug APK
 (`com.opencapture.openpocketcine.debug`, installs beside the official app).
+
+## Settings and zoom buttons
+
+- Each shot also keeps the camera settings at save time: exposure mode, ISO and shutter
+  (Manual) or EV and the Auto ISO ceiling (Auto), white balance (Auto with tint, or Kelvin and
+  tint), aperture strategy, focus mode and track, and the focus point. Recalling a shot sends
+  only what differs; the focus point is set when the gimbal arrives. Format and color mode are
+  not changed. Shots saved before this keep working without settings; **Update** adds them.
+- The zoom chip beside the gimbal stick is replaced by three buttons: **1×, 3×, 6×** (only the
+  stops the lens reaches are shown).

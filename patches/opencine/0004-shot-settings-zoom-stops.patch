@@ -1,0 +1,348 @@
+From c076cb710f63993beb9c0b3ac29f9c2cd6e4dbb1 Mon Sep 17 00:00:00 2001
+From: Davide Frangione <frangionedavide@gmail.com>
+Date: Sun, 8 Nov 2026 11:06:43 +0100
+Subject: [PATCH] feat: shot presets keep camera settings; 1x/3x/6x zoom
+ buttons
+
+---
+ .../cameracontrols/GimbalShotPresets.kt       | 33 ++++++++--
+ .../opencine/cameracontrols/LiveZoomChrome.kt | 65 +++++++++++++++++++
+ .../MonitorOperatorVocabularySurface.kt       |  6 ++
+ .../cameracontrols/GimbalShotPresetsTest.kt   | 18 +++++
+ .../cameracontrols/LiveZoomStopButtonsTest.kt | 31 +++++++++
+ .../opencine/dji/PocketCameraSession.kt       | 26 +++++---
+ 6 files changed, 165 insertions(+), 14 deletions(-)
+ create mode 100644 Android/camera-controls/src/test/kotlin/com/opencapture/opencine/cameracontrols/LiveZoomStopButtonsTest.kt
+
+diff --git a/Android/camera-controls/src/main/kotlin/com/opencapture/opencine/cameracontrols/GimbalShotPresets.kt b/Android/camera-controls/src/main/kotlin/com/opencapture/opencine/cameracontrols/GimbalShotPresets.kt
+index d945bf14..4155cd5a 100644
+--- a/Android/camera-controls/src/main/kotlin/com/opencapture/opencine/cameracontrols/GimbalShotPresets.kt
++++ b/Android/camera-controls/src/main/kotlin/com/opencapture/opencine/cameracontrols/GimbalShotPresets.kt
+@@ -11,9 +11,15 @@ data class GimbalShotPreset(
+     val id: String,
+     val name: String,
+     val pose: GimbalWaypoint,
++    /**
++     * Camera settings captured with the framing (exposure, white balance, focus…), as named
++     * integers the app owns. Empty for shots saved before settings were captured.
++     */
++    val settings: Map<String, Int> = emptyMap(),
+ ) {
+     val readout: String
+-        get() = String.format(Locale.US, "PAN %+.0f°  TILT %+.0f°  %.1f×", pose.yawDeg, pose.pitchDeg, pose.zoom)
++        get() = String.format(Locale.US, "PAN %+.0f°  TILT %+.0f°  %.1f×", pose.yawDeg, pose.pitchDeg, pose.zoom) +
++            if (settings.isEmpty()) "" else "  · SETTINGS"
+ }
+ 
+ /** Pure list rules and a line codec for shot presets; storage is the app's. */
+@@ -39,8 +45,25 @@ object GimbalShotPresets {
+     fun add(presets: List<GimbalShotPreset>, preset: GimbalShotPreset): List<GimbalShotPreset>? =
+         if (presets.size >= MAX_PRESETS) null else presets + preset
+ 
+-    fun replacePose(presets: List<GimbalShotPreset>, id: String, pose: GimbalWaypoint): List<GimbalShotPreset> =
+-        presets.map { if (it.id == id) it.copy(pose = pose) else it }
++    fun replacePose(presets: List<GimbalShotPreset>, id: String, pose: GimbalWaypoint,
++        settings: Map<String, Int>? = null): List<GimbalShotPreset> =
++        presets.map { if (it.id == id) it.copy(pose = pose, settings = settings ?: it.settings) else it }
++
++    private val settingKey = Regex("[A-Za-z][A-Za-z0-9]{0,15}")
++
++    fun encodeSettings(settings: Map<String, Int>): String =
++        settings.filterKeys { settingKey.matches(it) }.entries.sortedBy { it.key }.joinToString(",") { "${it.key}=${it.value}" }
++
++    fun decodeSettings(text: String?): Map<String, Int> {
++        if (text.isNullOrBlank()) return emptyMap()
++        return text.split(',').mapNotNull { part ->
++            val eq = part.indexOf('=')
++            if (eq <= 0) return@mapNotNull null
++            val key = part.substring(0, eq)
++            val value = part.substring(eq + 1).toIntOrNull() ?: return@mapNotNull null
++            if (settingKey.matches(key)) key to value else null
++        }.toMap()
++    }
+ 
+     fun rename(presets: List<GimbalShotPreset>, id: String, name: String): List<GimbalShotPreset> {
+         val clean = cleanName(name)
+@@ -63,7 +86,7 @@ object GimbalShotPresets {
+         for (p in presets) {
+             append(listOf(
+                 p.id, cleanName(p.name), p.pose.yawDeg.toString(), p.pose.pitchDeg.toString(),
+-                p.pose.zoom.toString(), p.pose.nativePitchDeg?.toString() ?: "",
++                p.pose.zoom.toString(), p.pose.nativePitchDeg?.toString() ?: "", encodeSettings(p.settings),
+             ).joinToString("\t")).append('\n')
+         }
+     }
+@@ -83,7 +106,7 @@ object GimbalShotPresets {
+             if (!yaw.isFinite() || !pitch.isFinite() || !zoom.isFinite() || native?.isFinite() == false) return@mapNotNull null
+             val name = cleanName(f[1]).ifEmpty { return@mapNotNull null }
+             if (f[0].isBlank()) return@mapNotNull null
+-            GimbalShotPreset(f[0], name, GimbalWaypoint(yaw, pitch, zoom, native))
++            GimbalShotPreset(f[0], name, GimbalWaypoint(yaw, pitch, zoom, native), decodeSettings(f.getOrNull(6)))
+         }.distinctBy { it.id }.take(MAX_PRESETS)
+     }
+ }
+diff --git a/Android/camera-controls/src/main/kotlin/com/opencapture/opencine/cameracontrols/LiveZoomChrome.kt b/Android/camera-controls/src/main/kotlin/com/opencapture/opencine/cameracontrols/LiveZoomChrome.kt
+index bc9365b1..faa07b29 100644
+--- a/Android/camera-controls/src/main/kotlin/com/opencapture/opencine/cameracontrols/LiveZoomChrome.kt
++++ b/Android/camera-controls/src/main/kotlin/com/opencapture/opencine/cameracontrols/LiveZoomChrome.kt
+@@ -7,7 +7,10 @@ import androidx.compose.foundation.Canvas
+ import androidx.compose.foundation.combinedClickable
+ import androidx.compose.foundation.interaction.MutableInteractionSource
+ import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxHeight
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.size
+ import androidx.compose.foundation.shape.CircleShape
+@@ -25,6 +28,9 @@ import androidx.compose.runtime.setValue
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.ExperimentalComposeUiApi
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.alpha
++import androidx.compose.ui.semantics.Role
++import androidx.compose.ui.semantics.role
+ import androidx.compose.ui.geometry.CornerRadius
+ import androidx.compose.ui.geometry.Offset
+ import androidx.compose.ui.geometry.Size
+@@ -50,6 +56,7 @@ import com.opencapture.opencine.vocabulary.LiveFeedFocusGesture
+ import com.opencapture.opencine.vocabulary.TrackingBox
+ import kotlin.math.abs
+ import kotlin.math.hypot
++import kotlin.math.max
+ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.delay
+ import kotlinx.coroutines.launch
+@@ -401,3 +408,61 @@ private class FeedGestureState {
+ 
+ @Composable
+ private fun rememberFeedGestureState(): FeedGestureState = remember { FeedGestureState() }
++
++/** The fixed zoom buttons beside the gimbal stick, in place of the cycling chip. */
++object LiveZoomStopButtons {
++    val STOPS: List<Double> = listOf(1.0, 3.0, 6.0)
++    const val GAP: Float = 4f
++
++    /** Stops this lens can reach; 1× always stays. */
++    fun reachable(maximum: Double): List<Double> = STOPS.filter { it <= 1.0 || it <= maximum + 1e-6 }
++
++    /** The stop the lens is at, within the chip's jitter tolerance, else null. */
++    fun active(factor: Double, stops: List<Double>): Double? =
++        stops.firstOrNull { kotlin.math.abs(it - factor) < 0.15 }
++
++    /** A row ending at the chip's trailing edge, one chip-height button per stop. */
++    fun frame(chip: MonitorRect, count: Int, minX: Float): MonitorRect {
++        val size = chip.height
++        val width = count * size + (count - 1).coerceAtLeast(0) * GAP
++        val x = max(minX, chip.maxX - width)
++        return MonitorRect(x, chip.y, width, size)
++    }
++
++    fun label(stop: Double): String = if (stop % 1.0 == 0.0) "${stop.toInt()}×" else "$stop×"
++}
++
++@Composable
++fun LiveZoomStopRow(
++    factor: Double,
++    stops: List<Double>,
++    locked: Boolean,
++    dimmed: Boolean,
++    onSelect: (Double) -> Unit,
++    modifier: Modifier = Modifier,
++) {
++    val haptics = LocalOperatorHaptics.current
++    val active = LiveZoomStopButtons.active(factor, stops)
++    Row(modifier.testTag("live.zoom.stops").alpha(if (locked || dimmed) .4f else 1f),
++        horizontalArrangement = Arrangement.spacedBy(LiveZoomStopButtons.GAP.dp)) {
++        for (stop in stops) {
++            val selected = stop == active
++            Box(
++                Modifier.weight(1f).fillMaxHeight()
++                    .monitorGlass(CircleShape)
++                    .then(if (selected) Modifier.background(LiveDesign.accent, CircleShape) else Modifier)
++                    .testTag("live.zoom.${LiveZoomStopButtons.label(stop)}")
++                    .chromeClickable(enabled = !locked, onClick = { haptics.selection(); onSelect(stop) })
++                    .semantics {
++                        contentDescription = "Zoom ${LiveZoomStopButtons.label(stop)}"
++                        role = Role.Button
++                    },
++                contentAlignment = Alignment.Center,
++            ) {
++                Text(LiveZoomStopButtons.label(stop),
++                    color = if (selected) LiveDesign.background else LiveDesign.text,
++                    style = LiveType.ui(12f, FontWeight.Bold))
++            }
++        }
++    }
++}
+diff --git a/Android/camera-controls/src/main/kotlin/com/opencapture/opencine/cameracontrols/MonitorOperatorVocabularySurface.kt b/Android/camera-controls/src/main/kotlin/com/opencapture/opencine/cameracontrols/MonitorOperatorVocabularySurface.kt
+index 3df75c5d..dc0a30af 100644
+--- a/Android/camera-controls/src/main/kotlin/com/opencapture/opencine/cameracontrols/MonitorOperatorVocabularySurface.kt
++++ b/Android/camera-controls/src/main/kotlin/com/opencapture/opencine/cameracontrols/MonitorOperatorVocabularySurface.kt
+@@ -269,6 +269,12 @@ private fun <Host> MonitorOperatorNativeControls(source: MonitorOperatorLiveChro
+     Box(Modifier.fillMaxSize()) {
+         source.zoom?.let { zoom ->
+             if (!capturePresented && controls.zoom.isOffered && source.session.mounts(MonitorDisplaySection.ZOOM_CHIP) && !cluster.zoom.isEmpty) {
++              val zoomStops = LiveZoomStopButtons.reachable(zoom.maximum)
++              if (zoomStops.size > 1) {
++                val row = LiveZoomStopButtons.frame(cluster.zoom, zoomStops.size, kotlin.math.max(layout.safeLeading, 0f) + 8f)
++                LiveZoomStopRow(zoom.factor, zoomStops, locked, zoom.dimmed, onSelect = { zoom.commitCycle(it) },
++                    modifier = Modifier.operatorFrame(row).monitorChromeEditStroke(editing, true))
++              } else
+                 LiveZoomChip(zoom.factor, locked,
+                     Modifier.operatorFrame(cluster.zoom).alpha(if (locked || zoom.dimmed) .4f else 1f)
+                         .monitorChromeEditStroke(editing, true), zoom.pinching, zoom.dimmed,
+diff --git a/Android/camera-controls/src/test/kotlin/com/opencapture/opencine/cameracontrols/GimbalShotPresetsTest.kt b/Android/camera-controls/src/test/kotlin/com/opencapture/opencine/cameracontrols/GimbalShotPresetsTest.kt
+index 2b0e448f..703ebf5b 100644
+--- a/Android/camera-controls/src/test/kotlin/com/opencapture/opencine/cameracontrols/GimbalShotPresetsTest.kt
++++ b/Android/camera-controls/src/test/kotlin/com/opencapture/opencine/cameracontrols/GimbalShotPresetsTest.kt
+@@ -54,4 +54,22 @@ class GimbalShotPresetsTest {
+         assertEquals(listOf("b", "a", "c"), GimbalShotPresets.move(list, "b", -1).map { it.id })
+         assertEquals(list, GimbalShotPresets.move(list, "c", 1))
+     }
++
++    @Test
++    fun settingsRoundTripAndOldLinesStillLoad() {
++        val settings = mapOf("expo" to 4, "iso" to 3, "shutter" to 50, "kelvin" to 5600, "fx" to 5000)
++        val list = listOf(GimbalShotPreset("a", "Palco", GimbalWaypoint(1.0, 2.0, 3.0, 4.0), settings))
++        assertEquals(list, GimbalShotPresets.decode(GimbalShotPresets.encode(list)))
++        val old = "v1\na\tOld\t1\t2\t1\t\n"
++        assertEquals(emptyMap<String, Int>(), GimbalShotPresets.decode(old).single().settings)
++        assertEquals(mapOf("ok" to 1), GimbalShotPresets.decodeSettings("ok=1,bad,x=y,=3,9no=2"))
++    }
++
++    @Test
++    fun updateKeepsSettingsUnlessGiven() {
++        val list = listOf(GimbalShotPreset("a", "A", GimbalWaypoint(0.0, 0.0, 1.0), mapOf("iso" to 1)))
++        val pose = GimbalWaypoint(5.0, 0.0, 1.0)
++        assertEquals(mapOf("iso" to 1), GimbalShotPresets.replacePose(list, "a", pose).single().settings)
++        assertEquals(mapOf("iso" to 2), GimbalShotPresets.replacePose(list, "a", pose, mapOf("iso" to 2)).single().settings)
++    }
+ }
+diff --git a/Android/camera-controls/src/test/kotlin/com/opencapture/opencine/cameracontrols/LiveZoomStopButtonsTest.kt b/Android/camera-controls/src/test/kotlin/com/opencapture/opencine/cameracontrols/LiveZoomStopButtonsTest.kt
+new file mode 100644
+index 00000000..e6303be4
+--- /dev/null
++++ b/Android/camera-controls/src/test/kotlin/com/opencapture/opencine/cameracontrols/LiveZoomStopButtonsTest.kt
+@@ -0,0 +1,31 @@
++package com.opencapture.opencine.cameracontrols
++
++import com.opencapture.monitorui.MonitorRect
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertNull
++
++class LiveZoomStopButtonsTest {
++    @Test
++    fun stopsFollowTheLens() {
++        assertEquals(listOf(1.0, 3.0, 6.0), LiveZoomStopButtons.reachable(12.0))
++        assertEquals(listOf(1.0, 3.0), LiveZoomStopButtons.reachable(4.0))
++        assertEquals(listOf(1.0), LiveZoomStopButtons.reachable(1.0))
++    }
++
++    @Test
++    fun activeStopToleratesJitter() {
++        val stops = LiveZoomStopButtons.STOPS
++        assertEquals(3.0, LiveZoomStopButtons.active(3.08, stops))
++        assertNull(LiveZoomStopButtons.active(4.5, stops))
++    }
++
++    @Test
++    fun rowEndsAtTheChipAndStaysOnScreen() {
++        val row = LiveZoomStopButtons.frame(MonitorRect(300f, 500f, 44f, 44f), 3, 8f)
++        assertEquals(344f, row.maxX)
++        assertEquals(3 * 44f + 2 * LiveZoomStopButtons.GAP, row.width)
++        assertEquals(8f, LiveZoomStopButtons.frame(MonitorRect(20f, 0f, 44f, 44f), 3, 8f).x)
++        assertEquals("6×", LiveZoomStopButtons.label(6.0))
++    }
++}
+diff --git a/Android/dji/src/main/kotlin/com/opencapture/opencine/dji/PocketCameraSession.kt b/Android/dji/src/main/kotlin/com/opencapture/opencine/dji/PocketCameraSession.kt
+index 1861deaa..51e56425 100644
+--- a/Android/dji/src/main/kotlin/com/opencapture/opencine/dji/PocketCameraSession.kt
++++ b/Android/dji/src/main/kotlin/com/opencapture/opencine/dji/PocketCameraSession.kt
+@@ -5324,7 +5324,8 @@ class PocketCameraSession(
+         }
+     }
+ 
+-    private fun startNativeTake(link: DatalinkDriver, program: GimbalProgram, doneNote: String? = null) {
++    private fun startNativeTake(link: DatalinkDriver, program: GimbalProgram, doneNote: String? = null,
++        onArrived: (() -> Unit)? = null) {
+         moveToken = link.startNativeProgram(program) { progress ->
+             if (moveDatalink !== link || moveToken != progress.token) return@startNativeProgram
+             _gimbalMovePaused.value = progress.paused
+@@ -5336,6 +5337,7 @@ class PocketCameraSession(
+                 val failure = progress.failure
+                 if (failure != null) _controlNote.value = failure
+                 else if (doneNote != null) _controlNote.value = doneNote
++                val arrived = failure == null
+                 restGimbalStickWire()
+                 gimbalRestedAt = SystemClock.elapsedRealtime()
+                 _gimbalMoveRunning.value = false
+@@ -5343,33 +5345,38 @@ class PocketCameraSession(
+                 moveDriving = false
+                 moveToken = null
+                 moveDatalink = null
++                if (arrived) onArrived?.invoke()
+             }
+         }
+     }
+ 
++    /** Focus on a point of the picture (0…1 each way), as a tap on the live view does. */
++    fun focusAtPoint(x: Float, y: Float) = markFocus(x, y)
++
+     /**
+      * Shot preset recall: one timed move from the live pose to [target] over [durationSeconds],
+      * with no countdown and a short settle. Pan, tilt and zoom are absolute to the handle, so a
+      * preset holds only while the handle stays where it was when the preset was saved.
+      */
+-    fun recallGimbalPreset(target: GimbalWaypoint, durationSeconds: Double, name: String) {
+-        if (!hasGimbal) return
++    fun recallGimbalPreset(target: GimbalWaypoint, durationSeconds: Double, name: String,
++        onArrived: (() -> Unit)? = null): Boolean {
++        if (!hasGimbal) return false
+         if (_gimbalMoveRunning.value) cancelProgrammedMove()
+         if (!firstPictureSettled || decoder.lastPresentedAt == null || isLiveVideoStale()) {
+             _controlNote.value = "Wait for live video before recalling a shot"
+-            return
++            return false
+         }
+-        val link = datalink ?: return
++        val link = datalink ?: return false
+         val feedback = link.latestNativeProgramFeedback
+         val live = liveGimbalWaypoint
+         if (feedback == null || live == null || live.nativePitchDeg == null ||
+             SystemClock.elapsedRealtimeNanos() / 1e9 - feedback.receivedAt !in 0.0..0.3) {
+             _controlNote.value = GimbalHudCopy.POSE_NOT_READY
+-            return
++            return false
+         }
+         if (target != target.clamped() || target.nativePitchDeg == null) {
+             _controlNote.value = "Save \"$name\" again: it is outside the gimbal limits"
+-            return
++            return false
+         }
+         val start = live.clamped()
+         var end = target
+@@ -5384,7 +5391,7 @@ class PocketCameraSession(
+             note = "Shot: $name (zoom unchanged: $it)"
+             if (link.programmedZoomFailure(program) != null) {
+                 _controlNote.value = it
+-                return
++                return false
+             }
+         }
+         cancelProgrammedMove()
+@@ -5408,7 +5415,8 @@ class PocketCameraSession(
+         lastMoveReadout = null
+         moveDatalink = link
+         prepProgrammedMoveGimbal()
+-        startNativeTake(link, program, note)
++        startNativeTake(link, program, note, onArrived)
++        return true
+     }
+ 
+     fun pauseProgrammedMove() {
+-- 
+2.43.0
+
