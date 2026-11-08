@@ -7,3 +7,9 @@ Lista raccolta per un unico aggiornamento. Si applica tutto insieme quando David
      (da sinistra verso l'alto), alla stessa distanza dal bordo del joystick, seguendone la curva.
    - **Leggermente più piccoli** di adesso.
    - **Tondi**, con lo stesso stile **trasparente** (vetro) dei pulsanti A–F delle inquadrature.
+2. **Controllo dei DJI Mic 2 collegati alla Pocket.** *(serve prima la registrazione dei comandi)*
+   - Regolare il **volume (gain)** di ciascun trasmettitore dall'app.
+   - **Attivare/disattivare la registrazione interna** dei trasmettitori.
+   - Prerequisito: registro Bluetooth HCI dell'S25 Ultra mentre in DJI Mimo si cambiano gain e
+     registrazione interna (annotando l'ordine), per ricavare i comandi. Oggi l'app gestisce solo
+     l'audio interno della Pocket (mono/stereo, vento, direzione, voce) e mostra i livelli.
