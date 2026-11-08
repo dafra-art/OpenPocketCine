@@ -1,0 +1,107 @@
+From 2afd1b4340d45f1d0a762d9ad3a9908084f22fc0 Mon Sep 17 00:00:00 2001
+From: Davide Frangione <frangionedavide@gmail.com>
+Date: Sun, 8 Nov 2026 19:44:05 +0100
+Subject: [PATCH] fix: Pocket 4 Pro reports its access point as 00 08
+
+---
+ .../opencapture/opencine/dji/PocketCameraSession.kt    |  2 +-
+ .../kotlin/com/opencapture/opencine/dji/StationJoin.kt |  6 ++++--
+ Sources/OpenCineDJI/MulticamCommands.swift             | 10 ++++++++--
+ Sources/OpenCineDJI/StationJoin.swift                  |  4 ++--
+ Tests/OpenCineDJITests/MulticamTests.swift             |  7 ++++++-
+ 5 files changed, 21 insertions(+), 8 deletions(-)
+
+diff --git a/Android/dji/src/main/kotlin/com/opencapture/opencine/dji/PocketCameraSession.kt b/Android/dji/src/main/kotlin/com/opencapture/opencine/dji/PocketCameraSession.kt
+index 51e56425..907a95c8 100644
+--- a/Android/dji/src/main/kotlin/com/opencapture/opencine/dji/PocketCameraSession.kt
++++ b/Android/dji/src/main/kotlin/com/opencapture/opencine/dji/PocketCameraSession.kt
+@@ -1390,7 +1390,7 @@ class PocketCameraSession(
+             DjiLog.log("info", "session", "wifi",
+                 "wifi: camera role after restore ${role?.let(::hexBytes) ?: "no reply"} at " +
+                     "${"%.1f".format(Locale.US, (SystemClock.elapsedRealtime() - started) / 1000.0)} s")
+-            if (role?.contentEquals(byteArrayOf(0, 0)) == true) break
++            if (role?.contentEquals(byteArrayOf(0, 0)) == true || role?.contentEquals(byteArrayOf(0, 8)) == true) break
+             delay(1_000)
+         }
+     }
+diff --git a/Android/dji/src/main/kotlin/com/opencapture/opencine/dji/StationJoin.kt b/Android/dji/src/main/kotlin/com/opencapture/opencine/dji/StationJoin.kt
+index ce6ee39b..28940ba8 100644
+--- a/Android/dji/src/main/kotlin/com/opencapture/opencine/dji/StationJoin.kt
++++ b/Android/dji/src/main/kotlin/com/opencapture/opencine/dji/StationJoin.kt
+@@ -119,11 +119,13 @@ class StationJoin(
+                 var stationReady = false
+                 for (poll in 0 until 6) {
+                     val reported = hex(exchange(DjiNative.CMD_MULTICAM_WIFI_WORK_MODE, null, ROLE_TIMEOUT_MS))
+-                    if (reported == "0001") {
++                    log("station role readback=$reported poll=$poll")
++                    if (reported == "0001" || reported == "0009") {
+                         stationReady = true
+                         break
+                     }
+-                    if (reported != "0000") throw Failure.Rejected()
++                    // 00 08 is the access point on newer Pocket 4 Pro firmware.
++                    if (reported != "0000" && reported != "0008") throw Failure.Rejected()
+                     sleep(2_000)
+                 }
+                 if (!stationReady) throw Failure.RoleStarting()
+diff --git a/Sources/OpenCineDJI/MulticamCommands.swift b/Sources/OpenCineDJI/MulticamCommands.swift
+index a2e7cd71..26e947fe 100644
+--- a/Sources/OpenCineDJI/MulticamCommands.swift
++++ b/Sources/OpenCineDJI/MulticamCommands.swift
+@@ -69,9 +69,15 @@ public enum MulticamStationPolicy {
+     public enum Decision: Equatable {
+         case alreadyStation, setAndVerify, setWithoutReadback, reject
+     }
++    /// `00 00` is the camera's own access point; a Pocket 4 Pro on newer firmware reports `00 08`
++    /// for the same state, steadily after an explicit access-point restore (field, 2026-11-08).
++    public static func isAccessPoint(_ reply: [UInt8]) -> Bool { reply == [0, 0] || reply == [0, 8] }
++    /// `00 01` is station; `00 09` is accepted as the same state with the newer firmware's flag.
++    public static func isStation(_ reply: [UInt8]) -> Bool { reply == [0, 1] || reply == [0, 9] }
++
+     public static func decision(reply: [UInt8], allowMissingQuery: Bool) -> Decision {
+-        if reply == [0, 1] { return .alreadyStation }
+-        if reply == [0, 0] { return .setAndVerify }
++        if isStation(reply) { return .alreadyStation }
++        if isAccessPoint(reply) { return .setAndVerify }
+         if reply == [0xe0], allowMissingQuery { return .setWithoutReadback }
+         return .reject
+     }
+diff --git a/Sources/OpenCineDJI/StationJoin.swift b/Sources/OpenCineDJI/StationJoin.swift
+index 4992b57d..1cce12f1 100644
+--- a/Sources/OpenCineDJI/StationJoin.swift
++++ b/Sources/OpenCineDJI/StationJoin.swift
+@@ -102,11 +102,11 @@ public struct StationJoin {
+                     let reported = try await exchange(
+                         MulticamCommands.wifiWorkMode(seq: next()), 12
+                     ).payload
+-                    if reported == [0, 1] {
++                    if MulticamStationPolicy.isStation(reported) {
+                         stationReady = true
+                         break
+                     }
+-                    guard reported == [0, 0] else { throw Failure.rejected }
++                    guard MulticamStationPolicy.isAccessPoint(reported) else { throw Failure.rejected }
+                     try await sleep(2)
+                 }
+                 guard stationReady else { throw Failure.roleStarting }
+diff --git a/Tests/OpenCineDJITests/MulticamTests.swift b/Tests/OpenCineDJITests/MulticamTests.swift
+index 4dde848f..d386b177 100644
+--- a/Tests/OpenCineDJITests/MulticamTests.swift
++++ b/Tests/OpenCineDJITests/MulticamTests.swift
+@@ -15,7 +15,12 @@ struct MulticamTests {
+         #expect(
+             MulticamStationPolicy.decision(reply: [0, 1], allowMissingQuery: true)
+                 == .alreadyStation)
+-        for reply: [UInt8] in [[], [0], [0xff], [1, 0xff], [0xe0, 0]] {
++        // Pocket 4 Pro, newer firmware: 00 08 is its access point (field, 2026-11-08).
++        #expect(
++            MulticamStationPolicy.decision(reply: [0, 8], allowMissingQuery: false) == .setAndVerify)
++        #expect(
++            MulticamStationPolicy.decision(reply: [0, 9], allowMissingQuery: false) == .alreadyStation)
++        for reply: [UInt8] in [[], [0], [0xff], [1, 0xff], [0xe0, 0], [0, 2], [0, 0x0a]] {
+             #expect(
+                 MulticamStationPolicy.decision(reply: reply, allowMissingQuery: true) == .reject)
+         }
+-- 
+2.43.0
+
