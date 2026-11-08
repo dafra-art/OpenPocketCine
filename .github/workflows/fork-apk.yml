@@ -52,6 +52,11 @@ jobs:
         working-directory: Apps/Android
         run: |
           set -uo pipefail
+          # services.gradle.org has been timing out from runners: use Gradle's GitHub mirror (same zip,
+          # the wrapper still checks distributionSha256Sum when the file pins one).
+          sed -i -E 's#^distributionUrl=https\\?://services\.gradle\.org/distributions/gradle-([0-9.]+)-(bin|all)\.zip#distributionUrl=https\\://github.com/gradle/gradle-distributions/releases/download/v\1/gradle-\1-\2.zip#' \
+            gradle/wrapper/gradle-wrapper.properties
+          grep '^distributionUrl' gradle/wrapper/gradle-wrapper.properties
           sed -i 's/^networkTimeout=.*/networkTimeout=120000/' gradle/wrapper/gradle-wrapper.properties
           grep -q '^networkTimeout=' gradle/wrapper/gradle-wrapper.properties \
             || echo 'networkTimeout=120000' >> gradle/wrapper/gradle-wrapper.properties
